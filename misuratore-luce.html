@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Misuratore di luce</title>
+<style>
+  :root {
+    --night: #0e1522;
+    --day: #e9f1f7;
+    --accent: #f0a400;
+    --level: 0.3;
+    --ink: #e8eef7;
+  }
+  :root[data-tone="day"] { --ink: #0e1522; }
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 2rem;
+    min-height: 100dvh;
+    padding: max(1.5rem, env(safe-area-inset-top)) 1.5rem max(1.5rem, env(safe-area-inset-bottom));
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+    color: var(--ink);
+    background-color: color-mix(in srgb, var(--day) calc(var(--level) * 100%), var(--night));
+    transition: background-color 0.6s ease, color 0.6s ease;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    body { transition: none; }
+  }
+
+  h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+  #status { margin: 0.4rem 0 0; max-width: 34ch; line-height: 1.45; opacity: 0.8; }
+
+  main { max-width: 36rem; }
+
+  .reading { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+  #value {
+    font-size: clamp(5rem, 28vw, 9rem);
+    font-weight: 200;
+    line-height: 1;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+  }
+  #unit { font-size: 1.25rem; }
+  #label { margin: 0.75rem 0 2rem; font-size: 1.5rem; min-height: 2em; }
+
+  .scale { position: relative; height: 2px; background: currentColor; opacity: 0.9; margin: 1rem 0 0.6rem; }
+  .thumb {
+    position: absolute; top: 50%; left: calc(var(--level) * 100%);
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--accent); border: 2px solid currentColor;
+    transform: translate(-50%, -50%);
+    transition: left 0.4s ease;
+  }
+  @media (prefers-reduced-motion: reduce) { .thumb { transition: none; } }
+  .ticks { display: flex; justify-content: space-between; font-size: 0.9rem; opacity: 0.8; }
+
+  footer p { margin: 1rem 0 0; max-width: 40ch; font-size: 0.9rem; line-height: 1.45; opacity: 0.8; }
+
+  button {
+    min-height: 48px; padding: 0.7rem 1.6rem;
+    font: inherit; font-weight: 600; color: inherit;
+    background: transparent; border: 2px solid currentColor; border-radius: 999px;
+    cursor: pointer;
+  }
+  button:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  #video {
+    position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Luce nella stanza</h1>
+    <p id="status" role="status">Premi il pulsante per misurare la luce intorno a te.</p>
+  </header>
+
+  <main>
+    <div class="reading">
+      <span id="value">–</span>
+      <span id="unit"></span>
+    </div>
+    <p id="label"></p>
+    <div class="scale" aria-hidden="true"><div class="thumb"></div></div>
+    <div class="ticks" aria-hidden="true"><span>Buio</span><span>Luminoso</span></div>
+  </main>
+
+  <footer>
+    <button id="toggle" type="button">Misura la luce</button>
+    <p>Niente viene salvato o inviato: l’immagine della fotocamera resta sul telefono e diventa un solo numero.</p>
+  </footer>
+
+  <video id="video" playsinline muted></video>
+  <canvas id="canvas" width="32" height="24" hidden></canvas>
+
+  <script>
+const root = document.documentElement;
+const $ = (id) => document.getElementById(id);
+
+const valueEl = $('value');
+const unitEl = $('unit');
+const labelEl = $('label');
+const statusEl = $('status');
+const btn = $('toggle');
+const video = $('video');
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+let sensor = null;
+let stream = null;
+let timer = null;
+let smooth = null;
+let running = false;
+
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function render(level, value, unit, label) {
+  root.style.setProperty('--level', level.toFixed(3));
+  root.dataset.tone = level > 0.5 ? 'day' : 'night';
+  valueEl.textContent = value;
+  unitEl.textContent = unit;
+  labelEl.textContent = label;
+}
+
+/* ---------- Sensore di luce ambientale (valori in lux) ---------- */
+
+function luxLabel(lux) {
+  if (lux < 10) return 'Quasi buio';
+  if (lux < 50) return 'Buio';
+  if (lux < 200) return 'Luce soffusa, da casa';
+  if (lux < 500) return 'Luce normale da ufficio';
+  if (lux < 10000) return 'Molto luminoso';
+  return 'Luce del sole';
+}
+
+function onLux(lux) {
+  const level = clamp(Math.log10(lux + 1) / Math.log10(30001), 0, 1);
+  render(level, Math.round(lux).toLocaleString('it-IT'), 'lux', luxLabel(lux));
+}
+
+function startSensor() {
+  return new Promise((resolve) => {
+    if (!('AmbientLightSensor' in window)) return resolve(false);
+    let done = false;
+    const finish = (ok) => {
+      if (!done) {
+        done = true;
+        resolve(ok);
+      }
+    };
+    try {
+      const s = new AmbientLightSensor({ frequency: 4 });
+      s.addEventListener('reading', () => {
+        sensor = s;
+        finish(true);
+        onLux(s.illuminance);
+      });
+      s.addEventListener('error', () => {
+        s.stop();
+        finish(false);
+      });
+      s.start();
+      setTimeout(() => {
+        if (!done) {
+          s.stop();
+          finish(false);
+        }
+      }, 1500);
+    } catch (e) {
+      finish(false);
+    }
+  });
+}
+
+/* ---------- Fotocamera frontale (stima relativa) ---------- */
+
+function lumaLabel(y) {
+  if (y < 25) return 'Buio';
+  if (y < 60) return 'Poco luminoso';
+  if (y < 130) return 'Luce normale';
+  return 'Molto luminoso';
+}
+
+function sample() {
+  if (video.readyState < 2) return;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+  }
+  const luma = sum / (data.length / 4);
+  smooth = smooth === null ? luma : smooth * 0.7 + luma * 0.3;
+  render(clamp(smooth / 255, 0, 1), Math.round((smooth / 255) * 100), '%', lumaLabel(smooth));
+}
+
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('Il browser non chiede il permesso perché la pagina non è aperta in modo sicuro. Serve un indirizzo che inizia con https://: un file aperto direttamente dal telefono non basta.');
+    return false;
+  }
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const perm = await navigator.permissions.query({ name: 'camera' });
+      if (perm.state === 'denied') {
+        setStatus('La fotocamera è bloccata per questa pagina. Tocca l’icona accanto all’indirizzo, apri le impostazioni del sito, imposta Fotocamera su Consenti e ricarica.');
+        return false;
+      }
+    }
+  } catch (e) {
+    /* alcuni browser non supportano questa verifica: si prosegue */
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 160 }, height: { ideal: 120 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    smooth = null;
+    timer = setInterval(sample, 250);
+    setStatus('Stima con la fotocamera frontale: il valore è relativo, non in lux.');
+    return true;
+  } catch (e) {
+    if (e && e.name === 'NotAllowedError') {
+      setStatus('Permesso negato. Tocca l’icona accanto all’indirizzo, imposta Fotocamera su Consenti e riprova.');
+    } else if (e && e.name === 'NotFoundError') {
+      setStatus('Non trovo nessuna fotocamera su questo dispositivo.');
+    } else {
+      setStatus('Non riesco ad avviare la fotocamera. Chiudi le altre app che la usano e riprova.');
+    }
+    return false;
+  }
+}
+
+/* ---------- Avvio e stop ---------- */
+
+async function start() {
+  btn.disabled = true;
+  setStatus('Avvio della misura…');
+
+  let ok = await startSensor();
+  if (ok) {
+    setStatus('Misura dal sensore di luce del telefono, in lux.');
+  } else {
+    ok = await startCamera();
+  }
+
+  running = ok;
+  btn.textContent = ok ? 'Ferma la misura' : 'Riprova';
+  btn.disabled = false;
+}
+
+function stop() {
+  if (sensor) {
+    sensor.stop();
+    sensor = null;
+  }
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  if (stream) {
+    stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+  video.srcObject = null;
+  running = false;
+  btn.textContent = 'Misura la luce';
+  setStatus('Misura ferma. Premi il pulsante per ripartire.');
+}
+
+btn.addEventListener('click', () => (running ? stop() : start()));
+</script>
+</body>
+</html>
